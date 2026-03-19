@@ -1,19 +1,15 @@
+import os
 import logging
-import re
-from typing import Dict, List
-
-from PyQt6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QTextEdit,
-    QPushButton,
-    QProgressBar,
-)
+import numpy as np
+import pickle
+import torch
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
+                             QVBoxLayout, QHBoxLayout, QLabel,
+                             QTextEdit, QPushButton, QProgressBar, QMessageBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
+from src.model_inference import BiLSTMClassifier
+from src.text_processor import TextProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +17,8 @@ logger = logging.getLogger(__name__)
 class EmotionDetectorApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Анализатор эмоций текста")
-        self.resize(640, 590)
+        self.setWindowTitle("Анализатор тональности")
+        self.resize(600, 550)
 
         self.emotion_colors = {
             0: "#5dade2",  # Sadness
@@ -40,6 +36,7 @@ class EmotionDetectorApp(QMainWindow):
             4: "Cognition",
         }
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.text_processor = None
         self.max_len = 64
@@ -50,7 +47,17 @@ class EmotionDetectorApp(QMainWindow):
                 format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
             )
 
-        logger.info("UI запущен в демо-режиме без загрузки модели и токенизатора.")
+        try:
+            self.model, self.max_len = self.load_model_and_params()
+            self.text_processor = TextProcessor(max_len=self.max_len)
+            self.model.to(self.device)
+            self.model.eval()
+            logger.info("Модель загружена на устройстве: %s", self.device)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось загрузить модель:\n{str(e)}")
+            logger.exception("Ошибка при загрузке модели")
+            self.model = None
+
         self.setup_ui()
 
     def setup_ui(self):
@@ -65,7 +72,6 @@ class EmotionDetectorApp(QMainWindow):
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title_label)
 
-
         self.input_label = QLabel("Введите сообщение на английском:")
         self.input_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         main_layout.addWidget(self.input_label)
@@ -77,7 +83,7 @@ class EmotionDetectorApp(QMainWindow):
 
         self.predict_btn = QPushButton("🔍 Распознать эмоцию")
         self.predict_btn.setMinimumHeight(45)
-        self.predict_btn.clicked[bool].connect(self.on_predict_click)
+        self.predict_btn.clicked.connect(self.on_predict_click)
         main_layout.addWidget(self.predict_btn)
 
         self.result_label = QLabel("Эмоция: ...")
@@ -108,57 +114,61 @@ class EmotionDetectorApp(QMainWindow):
         main_layout.addLayout(probs_layout)
 
     def load_model_and_params(self):
-        logger.info("Демо-режим: загрузка модели отключена.")
-        return None, self.max_len
+        logger.info("Загрузка модели и параметров...")
+        params_path = "src/models/model_params.pkl"
+        weights_path = "src/models/best_emotion_model.pth"
+
+        with open(params_path, "rb") as f:
+            params = pickle.load(f)
+
+        hidden_dim = params.get("hidden_dim", 128)
+        num_layers = params.get("num_layers", 2)
+        num_classes = params.get("num_classes", 6)
+        max_len = params.get("max_len", 64)
+        embedding_matrix = params.get("embedding_matrix")
+
+        if embedding_matrix is None:
+            raise ValueError("Матрица эмбеддингов не найдена в pickle файле!")
+
+        pretrained_embeddings = torch.FloatTensor(embedding_matrix)
+
+        model = BiLSTMClassifier(
+            pretrained_embeddings=pretrained_embeddings,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_classes=num_classes,
+        )
+
+        checkpoint = torch.load(weights_path, map_location=torch.device("cpu"))
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
+
+        logger.info("Модель успешно загружена.")
+        return model, max_len
 
     def preprocess_text(self, text):
-        """Заглушка препроцессинга: нормализует текст без внешних зависимостей."""
-        normalized_text = (text or "").strip().lower()
-        normalized_text = re.sub(r"\s+", " ", normalized_text)
-        normalized_text = re.sub(r"[^a-z0-9\s'\-.,!?]", "", normalized_text)
-        return normalized_text
+        if self.model is None or self.text_processor is None:
+            return None
+        return self.text_processor.get_input_ids(text)
 
     def predict_emotion(self, tensor_input):
-        """Демонстрационный классификатор без нейросети."""
-        text = self.preprocess_text(tensor_input)
-        if not text:
-            return [0.2] * len(self.classes)
+        if self.model is None or tensor_input is None:
+            return np.zeros(len(self.classes), dtype=float)
 
-        keyword_groups: Dict[int, List[str]] = {
-            0: ["sad", "sadness", "lonely", "cry", "depressed", "sorry"],
-            1: ["ok", "fine", "normal", "neutral", "average"],
-            2: ["happy", "great", "good", "awesome", "love", "wonderful", "joy"],
-            3: ["bad", "angry", "hate", "terrible", "awful", "mad"],
-            4: ["think", "understand", "reason", "because", "analyze", "cognition"],
-        }
+        with torch.no_grad():
+            tensor_input = tensor_input.to(self.device)
+            logits = self.model(tensor_input)
+            probs = torch.sigmoid(logits).cpu().numpy()[0]
 
-        scores = [1.0] * len(self.classes)
-        for class_id, keywords in keyword_groups.items():
-            for keyword in keywords:
-                if keyword in text:
-                    scores[class_id] += 2.0
-
-        total = sum(scores)
-        if total <= 0:
-            return [0.2] * len(self.classes)
-
-        return [score / total for score in scores]
-
-    def _format_result(self, probabilities):
-        best_class_idx = max(range(len(probabilities)), key=lambda idx: probabilities[idx])
-        best_emotion = self.classes.get(best_class_idx, "Неизвестно")
-        confidence = probabilities[best_class_idx] * 100
-
-        if confidence < 30:
-            self.result_label.setText("🤔 Эмоция не выражена ярко")
-            self.result_label.setStyleSheet("color: #7f8c8d;")
+        shown_classes_count = len(self.classes)
+        if probs.shape[0] >= shown_classes_count:
+            probs = probs[:shown_classes_count]
         else:
-            self.result_label.setText(f"🎯 Главная эмоция: {best_emotion} ({confidence:.1f}%)")
-            self.result_label.setStyleSheet("color: #2c3e50;")
+            probs = np.pad(probs, (0, shown_classes_count - probs.shape[0]), mode="constant")
 
-        for class_id, pb in self.progress_bars.items():
-            percentage = int(probabilities[class_id] * 100)
-            pb.setValue(percentage)
+        return probs
 
     def on_predict_click(self):
         text = self.text_input.toPlainText().strip()
@@ -169,13 +179,27 @@ class EmotionDetectorApp(QMainWindow):
         self.predict_btn.setText("⏳ Обработка...")
 
         try:
-            probabilities = self.predict_emotion(text)
-            self._format_result(probabilities)
-            logger.info("Демо-предсказание выполнено для текста длиной %s символов", len(text))
+            input_ids = self.preprocess_text(text)
+            probabilities = self.predict_emotion(input_ids)
+
+            best_class_idx = int(np.argmax(probabilities))
+            best_emotion = self.classes.get(best_class_idx, "Неизвестно")
+            confidence = probabilities[best_class_idx] * 100
+
+            if confidence < 30:
+                self.result_label.setText("🤔 Эмоция не выражена ярко")
+                self.result_label.setStyleSheet("color: #7f8c8d;")
+            else:
+                self.result_label.setText(f"🎯 Главная эмоция: {best_emotion} ({confidence:.1f}%)")
+                self.result_label.setStyleSheet("color: #2c3e50;")
+
+            for class_id, pb in self.progress_bars.items():
+                percentage = int(probabilities[class_id] * 100)
+                pb.setValue(percentage)
 
         except Exception as e:
             self.result_label.setText("❌ Ошибка")
-            logger.exception("Ошибка во время демо-предсказания")
+            logger.exception("Ошибка во время предсказания")
 
         finally:
             self.predict_btn.setEnabled(True)
